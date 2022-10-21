@@ -93,7 +93,7 @@ func WithSendCompression(name string) ClientOption {
 
 // WithSendGzip configures the client to gzip requests. Since clients have
 // access to a gzip compressor by default, WithSendGzip doesn't require
-// [WithSendCompresion].
+// [WithSendCompression].
 //
 // Some servers don't support gzip, so clients default to sending uncompressed
 // requests.
