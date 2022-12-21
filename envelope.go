@@ -180,6 +180,15 @@ func (r *envelopeReader) Unmarshal(message any) *Error {
 		if _, err := r.last.Data.ReadFrom(data); err != nil {
 			return errorf(CodeUnknown, "copy final envelope: %w", err)
 		}
+		// Make sure the response body doesn't include trailing invalid data
+		// TODO: should there be a limit to how much data we'll discard before deciding
+		//  to just close the reader/cancel the operation (closing/canceling prematurely
+		//  can mean connection can't be re-used, but that's only with HTTP 1.1)
+		if n, err := io.Copy(io.Discard, r.reader); n > 0 {
+			return errorf(CodeUnknown, "corrupt response: %d extra bytes after end of stream", n)
+		} else if err != nil {
+			return errorf(CodeUnknown, "corrupt response: I/O error after end-stream message: %w", err)
+		}
 		return errSpecialEnvelope
 	}
 

@@ -17,8 +17,10 @@ package connect_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bufbuild/connect-go"
@@ -70,7 +72,7 @@ func TestNewClient_InitFailure(t *testing.T) {
 	})
 }
 
-func TestClientPeer(t *testing.T) {
+func TestClientEndToEnd(t *testing.T) {
 	t.Parallel()
 	mux := http.NewServeMux()
 	mux.Handle(pingv1connect.NewPingServiceHandler(pingServer{}))
@@ -80,9 +82,9 @@ func TestClientPeer(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	run := func(t *testing.T, opts ...connect.ClientOption) {
-		t.Helper()
+		httpClient := &drainTestClient{t: t, client: server.Client()}
 		client := pingv1connect.NewPingServiceClient(
-			server.Client(),
+			httpClient,
 			server.URL,
 			connect.WithClientOptions(opts...),
 			connect.WithInterceptors(&assertPeerInterceptor{t}),
@@ -91,32 +93,49 @@ func TestClientPeer(t *testing.T) {
 		// unary
 		_, err := client.Ping(ctx, connect.NewRequest(&pingv1.PingRequest{}))
 		assert.Nil(t, err)
+		assert.True(t, httpClient.CheckDrained())
 		// client streaming
+		ctx, cancel := context.WithCancel(ctx)
+		t.Cleanup(cancel)
 		clientStream := client.Sum(ctx)
-		t.Cleanup(func() {
-			_, closeErr := clientStream.CloseAndReceive()
-			assert.Nil(t, closeErr)
-		})
 		assert.NotZero(t, clientStream.Peer().Addr)
 		assert.NotZero(t, clientStream.Peer().Protocol)
 		err = clientStream.Send(&pingv1.SumRequest{})
 		assert.Nil(t, err)
+		_, closeErr := clientStream.CloseAndReceive()
+		assert.Nil(t, closeErr)
+		assert.True(t, httpClient.CheckDrained())
 		// server streaming
-		serverStream, err := client.CountUp(ctx, connect.NewRequest(&pingv1.CountUpRequest{}))
-		t.Cleanup(func() {
-			assert.Nil(t, serverStream.Close())
-		})
+		ctx, cancel = context.WithCancel(ctx)
+		t.Cleanup(cancel)
+		serverStream, err := client.CountUp(ctx, connect.NewRequest(&pingv1.CountUpRequest{Number: 1}))
 		assert.Nil(t, err)
+		for {
+			if !serverStream.Receive() {
+				assert.Nil(t, serverStream.Err())
+				break
+			}
+		}
+		assert.True(t, httpClient.CheckDrained())
+		assert.Nil(t, serverStream.Close())
 		// bidi streaming
+		ctx, cancel = context.WithCancel(ctx)
+		t.Cleanup(cancel)
 		bidiStream := client.CumSum(ctx)
-		t.Cleanup(func() {
-			assert.Nil(t, bidiStream.CloseRequest())
-			assert.Nil(t, bidiStream.CloseResponse())
-		})
 		assert.NotZero(t, bidiStream.Peer().Addr)
 		assert.NotZero(t, bidiStream.Peer().Protocol)
 		err = bidiStream.Send(&pingv1.CumSumRequest{})
 		assert.Nil(t, err)
+		assert.Nil(t, bidiStream.CloseRequest())
+		for {
+			_, err := bidiStream.Receive()
+			if err != nil {
+				assert.True(t, errors.Is(err, io.EOF))
+				break
+			}
+		}
+		assert.True(t, httpClient.CheckDrained())
+		assert.Nil(t, bidiStream.CloseResponse())
 	}
 
 	t.Run("connect", func(t *testing.T) {
@@ -162,4 +181,38 @@ func (a *assertPeerInterceptor) WrapStreamingHandler(next connect.StreamingHandl
 		assert.NotZero(a.tb, conn.Spec())
 		return next(ctx, conn)
 	}
+}
+
+type drainTestClient struct {
+	t       *testing.T
+	client  *http.Client
+	drained atomic.Bool
+}
+
+func (c *drainTestClient) Do(req *http.Request) (*http.Response, error) {
+	resp, err := c.client.Do(req)
+	if err != nil || resp.Body == nil {
+		return resp, err
+	}
+	resp.Body = &drainTestReader{t: c.t, ReadCloser: resp.Body, drained: &c.drained}
+	return resp, nil
+}
+
+func (c *drainTestClient) CheckDrained() bool {
+	return c.drained.Swap(false)
+}
+
+type drainTestReader struct {
+	t *testing.T
+	io.ReadCloser
+	drained *atomic.Bool
+}
+
+func (r *drainTestReader) Read(p []byte) (n int, err error) {
+	n, err = r.ReadCloser.Read(p)
+	if err != nil {
+		r.t.Logf("drained response body: %v", err)
+		r.drained.Store(true)
+	}
+	return n, err
 }
